@@ -2103,6 +2103,20 @@ def _run_single_child(
 
     child_pool = getattr(child, "_credential_pool", None)
     leased_cred_id = None
+    credential_error = None
+
+    def _pool_policy_denied(pool: Any) -> bool:
+        try:
+            from agent.credential_pool import usage_admission_policy_denied
+
+            pool_provider = str(getattr(pool, "provider", "") or "")
+            return bool(
+                pool_provider and usage_admission_policy_denied(pool_provider)
+            )
+        except Exception as exc:
+            logger.debug("Failed to inspect child credential admission: %s", exc)
+            return False
+
     if child_pool is not None:
         leased_cred_id = child_pool.acquire_lease()
         if leased_cred_id is not None:
@@ -2112,6 +2126,49 @@ def _run_single_child(
                     child._swap_credential(leased_entry)
             except Exception as exc:
                 logger.debug("Failed to bind child to leased credential: %s", exc)
+                credential_error = (
+                    "The leased credential could not be bound to the delegated "
+                    "child, so the child was not started."
+                )
+        else:
+            if _pool_policy_denied(child_pool):
+                activated = False
+                activate_fallback = getattr(child, "_try_activate_fallback", None)
+                if callable(activate_fallback):
+                    try:
+                        activated = bool(activate_fallback())
+                    except Exception as exc:
+                        logger.debug(
+                            "Failed to activate child fallback after policy denial: %s",
+                            exc,
+                        )
+                if activated:
+                    child_pool = getattr(child, "_credential_pool", None)
+                    if child_pool is not None:
+                        leased_cred_id = child_pool.acquire_lease()
+                        if leased_cred_id is not None:
+                            try:
+                                leased_entry = child_pool.current()
+                                if leased_entry is not None and hasattr(
+                                    child, "_swap_credential"
+                                ):
+                                    child._swap_credential(leased_entry)
+                            except Exception as exc:
+                                logger.debug(
+                                    "Failed to bind child to fallback lease: %s", exc
+                                )
+                                credential_error = (
+                                    "The fallback credential could not be bound "
+                                    "to the delegated child, so the child was not "
+                                    "started."
+                                )
+                if not activated or (
+                    leased_cred_id is None and _pool_policy_denied(child_pool)
+                ):
+                    credential_error = (
+                        "No credential is eligible under the configured usage "
+                        "admission policy, and no fallback provider is available."
+                    )
 
     # Heartbeat: periodically propagate child activity to the parent so the
     # gateway inactivity timeout doesn't fire while the subagent is working.
@@ -2256,6 +2313,17 @@ def _run_single_child(
         )
 
     try:
+        if credential_error:
+            return {
+                "task_index": task_index,
+                "status": "error",
+                "summary": None,
+                "error": credential_error,
+                "exit_reason": "credential_unavailable",
+                "api_calls": 0,
+                "duration_seconds": round(time.monotonic() - child_start, 2),
+                "_child_role": getattr(child, "_delegate_role", None),
+            }
         _heartbeat_thread.start()
         if child_progress_cb:
             try:

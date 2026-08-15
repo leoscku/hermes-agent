@@ -160,7 +160,12 @@ def aux_probe_mode():
     finally:
         _aux_probe_state.active = prev
 
-from agent.credential_pool import load_pool
+from agent.credential_pool import (
+    get_pool_usage_limits,
+    load_pool,
+    usage_admission_credential_denied,
+    usage_admission_policy_denied,
+)
 from agent.model_metadata import MINIMUM_CONTEXT_LENGTH, get_model_context_length
 from hermes_cli.config import get_hermes_home
 from hermes_constants import OPENROUTER_BASE_URL
@@ -2510,6 +2515,8 @@ def _read_codex_access_token() -> Optional[str]:
         token = _pool_runtime_api_key(entry)
         if token:
             return token
+        if usage_admission_policy_denied("openai-codex"):
+            return None
 
     try:
         from hermes_cli.auth import _read_codex_tokens
@@ -3551,7 +3558,12 @@ def _build_xai_oauth_aux_client(model: str) -> Tuple[Optional[Any], Optional[str
     return CodexAuxiliaryClient(real_client, model), model
 
 
-def _build_codex_client(model: str) -> Tuple[Optional[Any], Optional[str]]:
+def _build_codex_client(
+    model: str,
+    *,
+    access_token: Optional[str] = None,
+    base_url: Optional[str] = None,
+) -> Tuple[Optional[Any], Optional[str]]:
     """Build a CodexAuxiliaryClient for an explicitly-requested model.
 
     There is no auto-selection of the Codex model: the ChatGPT-account
@@ -3560,7 +3572,10 @@ def _build_codex_client(model: str) -> Tuple[Optional[Any], Optional[str]]:
     is responsible for passing the model (e.g. from the user's own
     ``model.model`` or ``auxiliary.<task>.model`` config).
 
-    Returns (None, None) when no Codex OAuth token is available.
+    ``access_token`` and ``base_url`` bind the client to a credential already
+    selected by the caller. This avoids a second pool selection choosing a
+    different account between admission, cache-key construction, and client
+    creation. Returns (None, None) when no Codex OAuth token is available.
     """
     if not model:
         logger.warning(
@@ -3568,25 +3583,35 @@ def _build_codex_client(model: str) -> Tuple[Optional[Any], Optional[str]]:
             "pass model explicitly (auxiliary.<task>.model in config.yaml)."
         )
         return None, None
-    pool_present, entry = _select_pool_entry("openai-codex")
-    if pool_present:
-        codex_token = _pool_runtime_api_key(entry)
-        if codex_token:
-            base_url = _pool_runtime_base_url(entry, _CODEX_AUX_BASE_URL) or _CODEX_AUX_BASE_URL
+    codex_token = str(access_token or "").strip()
+    resolved_base_url = str(base_url or "").strip()
+    if codex_token:
+        resolved_base_url = resolved_base_url or _CODEX_AUX_BASE_URL
+    else:
+        pool_present, entry = _select_pool_entry("openai-codex")
+        if pool_present:
+            codex_token = _pool_runtime_api_key(entry)
+            if codex_token:
+                resolved_base_url = (
+                    _pool_runtime_base_url(entry, _CODEX_AUX_BASE_URL)
+                    or _CODEX_AUX_BASE_URL
+                )
+            else:
+                if usage_admission_policy_denied("openai-codex"):
+                    return None, None
+                codex_token = _read_codex_access_token()
+                if not codex_token:
+                    return None, None
+                resolved_base_url = _CODEX_AUX_BASE_URL
         else:
             codex_token = _read_codex_access_token()
             if not codex_token:
                 return None, None
-            base_url = _CODEX_AUX_BASE_URL
-    else:
-        codex_token = _read_codex_access_token()
-        if not codex_token:
-            return None, None
-        base_url = _CODEX_AUX_BASE_URL
+            resolved_base_url = _CODEX_AUX_BASE_URL
     logger.debug("Auxiliary client: Codex OAuth (%s via Responses API)", model)
     real_client = _create_openai_client(
         api_key=codex_token,
-        base_url=base_url,
+        base_url=resolved_base_url,
         default_headers=_codex_cloudflare_headers(codex_token),
     )
     return CodexAuxiliaryClient(real_client, model), model
@@ -4322,10 +4347,27 @@ def _evict_cached_clients(provider: str) -> None:
     """Drop cached auxiliary clients for a provider so fresh creds are used."""
     normalized = _normalize_aux_provider(provider)
     with _client_cache_lock:
-        stale_keys = [
-            key for key in _client_cache
-            if _normalize_aux_provider(str(key[0])) == normalized
-        ]
+        stale_keys = []
+        for key, entry in _client_cache.items():
+            cached = entry[0]
+            effective_provider = str(
+                getattr(cached, "_hermes_aux_effective_provider", "") or ""
+            )
+            if not effective_provider:
+                real_client = getattr(cached, "_real_client", None)
+                effective_provider = str(
+                    getattr(
+                        real_client,
+                        "_hermes_aux_effective_provider",
+                        "",
+                    )
+                    or ""
+                )
+            if (
+                _normalize_aux_provider(str(key[0])) == normalized
+                or _normalize_aux_provider(effective_provider) == normalized
+            ):
+                stale_keys.append(key)
         for key in stale_keys:
             client = _client_cache.get(key, (None, None, None))[0]
             if client is not None:
@@ -6205,10 +6247,20 @@ def resolve_provider_client(
                 "or auxiliary.<task>.model for per-task aux routing)."
             )
             return None, None
+        if explicit_api_key and usage_admission_credential_denied(
+            "openai-codex", explicit_api_key
+        ):
+            logger.info(
+                "resolve_provider_client: rejected a policy-denied "
+                "openai-codex credential"
+            )
+            return None, None
         if raw_codex:
             # Return the raw OpenAI client for callers that need direct
             # access to responses.stream() (e.g., the main agent loop).
-            codex_token = _read_codex_access_token()
+            codex_token = str(explicit_api_key or "").strip()
+            if not codex_token:
+                codex_token = _read_codex_access_token()
             if not codex_token:
                 logger.warning("resolve_provider_client: openai-codex requested "
                                "but no Codex OAuth token found (run: hermes model)")
@@ -6216,12 +6268,16 @@ def resolve_provider_client(
             final_model = _normalize_resolved_model(model, provider)
             raw_client = _create_openai_client(
                 api_key=codex_token,
-                base_url=_CODEX_AUX_BASE_URL,
+                base_url=explicit_base_url or _CODEX_AUX_BASE_URL,
                 default_headers=_codex_cloudflare_headers(codex_token),
             )
             return (raw_client, final_model)
         # Standard path: wrap in CodexAuxiliaryClient adapter
-        client, default = _build_codex_client(model)
+        client, default = _build_codex_client(
+            model,
+            access_token=explicit_api_key,
+            base_url=explicit_base_url,
+        )
         if client is None:
             logger.warning("resolve_provider_client: openai-codex requested "
                            "but no Codex OAuth token found (run: hermes model)")
@@ -7275,6 +7331,7 @@ def _client_cache_key(
     is_vision: bool = False,
     task: Optional[str] = None,
     model: Optional[str] = None,
+    pool_hint_override: Optional[str] = None,
 ) -> tuple:
     runtime = _normalize_main_runtime(main_runtime)
     runtime_key = tuple(
@@ -7285,7 +7342,11 @@ def _client_cache_key(
     # so the task participates in the cache key. Non-auto providers keep the
     # old cache shape because the explicit provider/model tuple is sufficient.
     task_key = (task or "") if provider == "auto" else ""
-    pool_hint = _pool_cache_hint(provider, main_runtime=main_runtime)
+    pool_hint = (
+        pool_hint_override
+        if pool_hint_override is not None
+        else _pool_cache_hint(provider, main_runtime=main_runtime)
+    )
     # The model MUST participate in the key. Two concurrent auxiliary calls to
     # the SAME provider/base_url/key but DIFFERENT models (e.g. a MoA reference
     # fan-out running opus + gpt-5.5 in parallel threads) would otherwise share
@@ -7520,17 +7581,80 @@ def _get_cached_client(
         except RuntimeError:
             pass
     runtime = _normalize_main_runtime(main_runtime)
+    admission_entry = None
+    pool_hint_override = None
+    explicit_credential_denied = False
+    admission_provider = _normalize_aux_provider(provider)
+    if admission_provider == "auto":
+        admission_provider = _normalize_aux_provider(
+            runtime.get("provider") or _read_main_provider()
+        )
+    if (
+        admission_provider == "openai-codex"
+        and get_pool_usage_limits("openai-codex")
+    ):
+        if api_key:
+            # Explicit credentials are keyed by their own fingerprint below.
+            pool_hint_override = ""
+            explicit_credential_denied = usage_admission_credential_denied(
+                "openai-codex", api_key
+            )
+        else:
+            pool_present, admission_entry = _select_pool_entry("openai-codex")
+            if (
+                pool_present
+                and admission_entry is None
+                and usage_admission_policy_denied("openai-codex")
+            ):
+                _evict_cached_clients("openai-codex")
+                # An explicit Codex auxiliary route must stop here, but an
+                # ``auto`` route still owns a fallback ladder.  Continue into
+                # resolve_provider_client("auto") so the next eligible provider
+                # can serve the auxiliary request.
+                if _normalize_aux_provider(provider) != "auto":
+                    return None, None
+            if admission_entry is not None:
+                admission_entry_id = str(
+                    getattr(admission_entry, "id", "") or ""
+                ).strip()
+                if admission_entry_id:
+                    pool_hint_override = f"openai-codex:{admission_entry_id}"
+
+    # Resolve the exact selected identity before constructing the cache key.
+    # Credential ID alone is insufficient because OAuth refresh can rotate the
+    # token and base URL while keeping the same stable pool ID.
+    effective_api_key = api_key
+    effective_base_url = base_url
+    if not effective_api_key:
+        selected_entry = admission_entry or _peek_pool_entry(
+            _normalize_aux_provider(provider)
+        )
+        if selected_entry is not None:
+            selected_key = _pool_runtime_api_key(selected_entry)
+            if selected_key:
+                effective_api_key = selected_key
+                if not effective_base_url:
+                    effective_base_url = _pool_runtime_base_url(
+                        selected_entry, _CODEX_AUX_BASE_URL
+                    )
     cache_key = _client_cache_key(
         provider,
         async_mode=async_mode,
-        base_url=base_url,
-        api_key=api_key,
+        base_url=effective_base_url,
+        api_key=effective_api_key,
         api_mode=api_mode,
         main_runtime=main_runtime,
         is_vision=is_vision,
         task=task,
         model=model,
+        pool_hint_override=pool_hint_override,
     )
+    if explicit_credential_denied:
+        with _client_cache_lock:
+            denied_entry = _client_cache.pop(cache_key, None)
+        if denied_entry is not None:
+            _close_cached_client(denied_entry[0])
+        return None, None
     with _client_cache_lock:
         if cache_key in _client_cache:
             cached_client, cached_default, cached_loop = _client_cache[cache_key]
@@ -7558,18 +7682,16 @@ def _get_cached_client(
     # always prefers env vars (first-entry bias), which bypasses pool rotation:
     # after key #1 is marked exhausted the retry would still get key #1 from
     # the env var and fail again, causing the retry2_err handler to mark key #2.
-    effective_api_key = api_key
-    if not effective_api_key:
-        _pe = _peek_pool_entry(_normalize_aux_provider(provider))
-        if _pe is not None:
-            _pk = _pool_runtime_api_key(_pe)
-            if _pk:
-                effective_api_key = _pk
+    resolved_provider = (
+        "openai-codex"
+        if admission_entry is not None and admission_provider == "openai-codex"
+        else provider
+    )
     client, default_model = resolve_provider_client(
-        provider,
+        resolved_provider,
         model,
         async_mode,
-        explicit_base_url=base_url,
+        explicit_base_url=effective_base_url,
         explicit_api_key=effective_api_key,
         api_mode=api_mode,
         main_runtime=runtime,

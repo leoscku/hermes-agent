@@ -17,6 +17,8 @@ from agent.credential_pool import (
     credential_pool_matches_provider,
     get_custom_provider_pool_key,
     load_pool,
+    usage_admission_credential_denied,
+    usage_admission_policy_denied,
 )
 from agent.secret_scope import get_secret as _get_secret
 from hermes_cli.auth import (
@@ -1540,6 +1542,16 @@ def _resolve_explicit_runtime(
             last_refresh = creds.get("last_refresh")
             if not explicit_base_url:
                 base_url = creds.get("base_url", "").rstrip("/") or base_url
+        if api_key and usage_admission_credential_denied(
+            "openai-codex", api_key
+        ):
+            raise AuthError(
+                "The selected Codex credential is excluded by its configured "
+                "usage policy.",
+                provider="openai-codex",
+                code="codex_credential_usage_policy_denied",
+                relogin_required=False,
+            )
         return {
             "provider": "openai-codex",
             "api_mode": "codex_responses",
@@ -1930,7 +1942,6 @@ def resolve_runtime_provider(
                 pool=pool,
                 target_model=target_model,
             )
-
     if provider == "nous":
         try:
             from hermes_cli.providers import nous_api_mode
@@ -1957,6 +1968,13 @@ def resolve_runtime_provider(
 
     if provider == "openai-codex":
         try:
+            if usage_admission_policy_denied(provider):
+                raise AuthError(
+                    "No eligible Codex credential is available in the configured pool.",
+                    provider="openai-codex",
+                    code="codex_pool_no_eligible_credentials",
+                    relogin_required=False,
+                )
             creds = resolve_codex_runtime_credentials()
             return {
                 "provider": "openai-codex",

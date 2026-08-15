@@ -28,6 +28,7 @@ class AccountUsageWindow:
     used_percent: Optional[float] = None
     reset_at: Optional[datetime] = None
     detail: Optional[str] = None
+    limit_window_seconds: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -40,6 +41,7 @@ class AccountUsageSnapshot:
     windows: tuple[AccountUsageWindow, ...] = ()
     details: tuple[str, ...] = ()
     unavailable_reason: Optional[str] = None
+    usage_windows_complete: bool = True
 
     @property
     def available(self) -> bool:
@@ -54,10 +56,16 @@ def _title_case_slug(value: Optional[str]) -> Optional[str]:
 
 
 def _parse_dt(value: Any) -> Optional[datetime]:
-    if value in {None, ""}:
+    if value is None or value == "" or isinstance(value, bool):
         return None
     if isinstance(value, (int, float)):
-        return datetime.fromtimestamp(float(value), tz=timezone.utc)
+        try:
+            timestamp = float(value)
+            if not math.isfinite(timestamp):
+                return None
+            return datetime.fromtimestamp(timestamp, tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
     if isinstance(value, str):
         text = value.strip()
         if not text:
@@ -510,6 +518,7 @@ def _resolve_codex_usage_credentials(
 def _fetch_codex_account_usage(
     base_url: Optional[str] = None,
     api_key: Optional[str] = None,
+    timeout: float = 15.0,
 ) -> Optional[AccountUsageSnapshot]:
     token, resolved_base_url, account_id = _resolve_codex_usage_credentials(base_url, api_key)
     headers = {
@@ -519,22 +528,66 @@ def _fetch_codex_account_usage(
     }
     if account_id:
         headers["ChatGPT-Account-Id"] = account_id
-    with httpx.Client(timeout=15.0) as client:
+    with httpx.Client(timeout=timeout) as client:
         response = client.get(_resolve_codex_usage_url(resolved_base_url), headers=headers)
         response.raise_for_status()
     payload = response.json() or {}
     rate_limit = payload.get("rate_limit") or {}
     windows: list[AccountUsageWindow] = []
+    usage_windows_complete = True
     for key, label in (("primary_window", "Session"), ("secondary_window", "Weekly")):
-        window = rate_limit.get(key) or {}
+        window = rate_limit.get(key)
+        if window is None:
+            continue
+        if not isinstance(window, dict):
+            usage_windows_complete = False
+            continue
         used = window.get("used_percent")
         if used is None:
+            usage_windows_complete = False
             continue
+        if isinstance(used, bool):
+            usage_windows_complete = False
+            continue
+        try:
+            used_percent = float(used)
+        except (TypeError, ValueError):
+            usage_windows_complete = False
+            continue
+        if not math.isfinite(used_percent) or not 0 <= used_percent <= 100:
+            usage_windows_complete = False
+            continue
+        raw_window_seconds = window.get("limit_window_seconds")
+        window_seconds = None
+        if raw_window_seconds is not None:
+            if isinstance(raw_window_seconds, int) and not isinstance(
+                raw_window_seconds, bool
+            ):
+                if raw_window_seconds > 0:
+                    window_seconds = raw_window_seconds
+                else:
+                    usage_windows_complete = False
+            elif isinstance(raw_window_seconds, float):
+                if (
+                    math.isfinite(raw_window_seconds)
+                    and raw_window_seconds > 0
+                    and raw_window_seconds.is_integer()
+                ):
+                    window_seconds = int(raw_window_seconds)
+                else:
+                    usage_windows_complete = False
+            else:
+                usage_windows_complete = False
+        raw_reset_at = window.get("reset_at")
+        reset_at = _parse_dt(raw_reset_at)
+        if raw_reset_at is not None and reset_at is None:
+            usage_windows_complete = False
         windows.append(
             AccountUsageWindow(
                 label=label,
-                used_percent=float(used),
-                reset_at=_parse_dt(window.get("reset_at")),
+                used_percent=used_percent,
+                reset_at=reset_at,
+                limit_window_seconds=window_seconds,
             )
         )
     details: list[str] = []
@@ -560,6 +613,7 @@ def _fetch_codex_account_usage(
         plan=_title_case_slug(payload.get("plan_type")),
         windows=tuple(windows),
         details=tuple(details),
+        usage_windows_complete=usage_windows_complete,
     )
 
 
@@ -886,13 +940,18 @@ def fetch_account_usage(
     *,
     base_url: Optional[str] = None,
     api_key: Optional[str] = None,
+    timeout: Optional[float] = None,
 ) -> Optional[AccountUsageSnapshot]:
     normalized = str(provider or "").strip().lower()
     if normalized in {"", "auto", "custom"}:
         return None
     try:
         if normalized == "openai-codex":
-            return _fetch_codex_account_usage(base_url=base_url, api_key=api_key)
+            return _fetch_codex_account_usage(
+                base_url=base_url,
+                api_key=api_key,
+                timeout=15.0 if timeout is None else timeout,
+            )
         if normalized == "anthropic":
             return _fetch_anthropic_account_usage()
         if normalized == "openrouter":

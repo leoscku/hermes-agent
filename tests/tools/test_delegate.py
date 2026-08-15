@@ -961,6 +961,90 @@ class TestChildCredentialLeasing(unittest.TestCase):
         self.assertEqual(result["status"], "error")
         child._credential_pool.release_lease.assert_called_once_with("cred-a")
 
+    def test_run_single_child_stops_when_leased_credential_binding_fails(self):
+        from tools.delegate_tool import _run_single_child
+
+        child = MagicMock()
+        child._credential_pool = MagicMock(provider="openai-codex")
+        child._credential_pool.acquire_lease.return_value = "cred-b"
+        child._credential_pool.current.return_value = MagicMock(id="cred-b")
+        child._swap_credential.side_effect = RuntimeError("binding failed")
+
+        result = _run_single_child(
+            task_index=4,
+            goal="Never use the inherited denied credential",
+            child=child,
+            parent_agent=_make_mock_parent(),
+        )
+
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["exit_reason"], "credential_unavailable")
+        child.run_conversation.assert_not_called()
+        child._credential_pool.release_lease.assert_called_once_with("cred-b")
+
+    @patch("agent.credential_pool.usage_admission_policy_denied", return_value=True)
+    def test_run_single_child_does_not_use_inherited_policy_denied_credential(
+        self, _policy_denied
+    ):
+        from tools.delegate_tool import _run_single_child
+
+        child = MagicMock()
+        child._credential_pool = MagicMock(provider="openai-codex")
+        child._credential_pool.acquire_lease.return_value = None
+        child._try_activate_fallback.return_value = False
+
+        result = _run_single_child(
+            task_index=2,
+            goal="Respect the Codex reserve",
+            child=child,
+            parent_agent=_make_mock_parent(),
+        )
+
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["exit_reason"], "credential_unavailable")
+        child.run_conversation.assert_not_called()
+
+    @patch(
+        "agent.credential_pool.usage_admission_policy_denied",
+        side_effect=lambda provider: provider == "openai-codex",
+    )
+    def test_run_single_child_activates_fallback_after_policy_denial(
+        self, _policy_denied
+    ):
+        from tools.delegate_tool import _run_single_child
+
+        denied_pool = MagicMock(provider="openai-codex")
+        denied_pool.acquire_lease.return_value = None
+        fallback_pool = MagicMock(provider="anthropic")
+        fallback_pool.acquire_lease.return_value = None
+
+        child = MagicMock()
+        child._credential_pool = denied_pool
+
+        def activate_fallback():
+            child._credential_pool = fallback_pool
+            return True
+
+        child._try_activate_fallback.side_effect = activate_fallback
+        child.run_conversation.return_value = {
+            "final_response": "done on fallback",
+            "completed": True,
+            "interrupted": False,
+            "api_calls": 1,
+            "messages": [],
+        }
+
+        result = _run_single_child(
+            task_index=3,
+            goal="Use the configured fallback",
+            child=child,
+            parent_agent=_make_mock_parent(),
+        )
+
+        self.assertEqual(result["status"], "completed")
+        child._try_activate_fallback.assert_called_once_with()
+        child.run_conversation.assert_called_once()
+
 
 class TestDelegateHeartbeat(unittest.TestCase):
     """Heartbeat propagates child activity to parent during delegation.

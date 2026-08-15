@@ -489,6 +489,7 @@ class TestValidateConfigKey:
         "telegram.bot_token",
         "mcp_servers.foo.command",
         "providers.openrouter.api_key",
+        "credential_pool_usage_limits.openai-codex.43c798",
         "gateway.strict",
         "platforms.discord.enabled",
         "gateway.platforms.my_platform.extra.token",
