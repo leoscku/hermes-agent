@@ -5767,6 +5767,28 @@ class AIAgent:
             )
             return False
 
+        if self.provider == "openai-codex":
+            try:
+                from agent.credential_pool import usage_admission_credential_denied
+
+                singleton_denied = usage_admission_credential_denied(
+                    "openai-codex", new_key
+                )
+            except Exception:
+                # Usage admission is intentionally fail-open when telemetry or
+                # policy resolution is unavailable.
+                logger.debug(
+                    "OpenAI Codex singleton refresh admission check failed",
+                    exc_info=True,
+                )
+                singleton_denied = False
+            if singleton_denied:
+                logger.info(
+                    "OpenAI Codex singleton refresh produced a policy-excluded "
+                    "credential; refusing to install it"
+                )
+                return False
+
         self.api_key = api_key.strip()
         self.base_url = base_url.strip().rstrip("/")
         self._client_kwargs["api_key"] = self.api_key

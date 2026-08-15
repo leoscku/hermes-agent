@@ -1,3 +1,5 @@
+import base64
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -40,17 +42,21 @@ def codex_usage_payload():
             "primary_window": {
                 "used_percent": 21,
                 "reset_at": 1779846359,
+                "limit_window_seconds": 18_000,
             },
             "secondary_window": {
                 "used_percent": 4,
                 "reset_at": 1780230796,
+                "limit_window_seconds": 604_800,
             },
         },
         "credits": {"has_credits": False},
     }
 
 
-def test_codex_usage_prefers_explicit_live_agent_credentials(monkeypatch, codex_usage_payload):
+def test_codex_usage_prefers_explicit_live_agent_credentials(
+    monkeypatch, codex_usage_payload
+):
     calls = []
     monkeypatch.setattr(
         account_usage.httpx,
@@ -60,7 +66,9 @@ def test_codex_usage_prefers_explicit_live_agent_credentials(monkeypatch, codex_
     monkeypatch.setattr(
         account_usage,
         "resolve_codex_runtime_credentials",
-        lambda **kwargs: (_ for _ in ()).throw(AssertionError("legacy auth should not be used")),
+        lambda **kwargs: (_ for _ in ()).throw(
+            AssertionError("legacy auth should not be used")
+        ),
     )
 
     snapshot = account_usage.fetch_account_usage(
@@ -74,11 +82,277 @@ def test_codex_usage_prefers_explicit_live_agent_credentials(monkeypatch, codex_
     assert snapshot.plan == "Plus"
     assert [w.label for w in snapshot.windows] == ["Session", "Weekly"]
     assert snapshot.windows[0].used_percent == 21
+    assert snapshot.windows[0].limit_window_seconds == 18_000
+    assert snapshot.windows[1].limit_window_seconds == 604_800
     assert calls[0]["url"] == "https://chatgpt.com/backend-api/wham/usage"
     assert calls[0]["headers"]["Authorization"] == "Bearer live-agent-token"
 
 
-def test_codex_usage_falls_back_to_native_credential_pool(monkeypatch, codex_usage_payload):
+def test_codex_usage_marks_missing_reported_window_incomplete(
+    monkeypatch, codex_usage_payload
+):
+    calls = []
+    codex_usage_payload["rate_limit"].pop("secondary_window")
+    monkeypatch.setattr(
+        account_usage.httpx,
+        "Client",
+        lambda timeout: _FakeClient(calls, codex_usage_payload),
+    )
+
+    snapshot = account_usage.fetch_account_usage(
+        "openai-codex",
+        base_url="https://chatgpt.com/backend-api/codex",
+        api_key="live-agent-token",
+    )
+
+    assert snapshot is not None
+    assert len(snapshot.windows) == 1
+    assert snapshot.usage_windows_complete is False
+
+
+def test_codex_usage_explicit_workspace_jwt_sends_account_id_header(
+    monkeypatch, codex_usage_payload
+):
+    calls = []
+    claims = {
+        "https://api.openai.com/auth": {"chatgpt_account_id": "workspace-account"}
+    }
+    payload = base64.urlsafe_b64encode(json.dumps(claims).encode()).decode().rstrip("=")
+    token = f"header.{payload}.signature"
+    monkeypatch.setattr(
+        account_usage.httpx,
+        "Client",
+        lambda timeout: _FakeClient(calls, codex_usage_payload),
+    )
+
+    snapshot = account_usage.fetch_account_usage(
+        "openai-codex",
+        base_url="https://chatgpt.com/backend-api/codex",
+        api_key=token,
+    )
+
+    assert snapshot is not None
+    assert calls[0]["headers"]["ChatGPT-Account-Id"] == "workspace-account"
+
+
+@pytest.mark.parametrize(
+    "invalid_used_percent",
+    [True, -1, 101, float("nan"), "80", " 80 ", "8e1"],
+)
+def test_codex_usage_ignores_invalid_used_percent(
+    monkeypatch, codex_usage_payload, invalid_used_percent
+):
+    calls = []
+    codex_usage_payload["rate_limit"]["primary_window"]["used_percent"] = (
+        invalid_used_percent
+    )
+    codex_usage_payload["rate_limit"].pop("secondary_window")
+    monkeypatch.setattr(
+        account_usage.httpx,
+        "Client",
+        lambda timeout: _FakeClient(calls, codex_usage_payload),
+    )
+
+    snapshot = account_usage.fetch_account_usage(
+        "openai-codex",
+        base_url="https://chatgpt.com/backend-api/codex",
+        api_key="live-agent-token",
+    )
+
+    assert snapshot is not None
+    assert snapshot.windows == ()
+    assert snapshot.usage_windows_complete is False
+
+
+def test_codex_usage_marks_mixed_valid_and_invalid_windows_incomplete(
+    monkeypatch, codex_usage_payload
+):
+    calls = []
+    codex_usage_payload["rate_limit"]["primary_window"]["used_percent"] = "bad"
+    monkeypatch.setattr(
+        account_usage.httpx,
+        "Client",
+        lambda timeout: _FakeClient(calls, codex_usage_payload),
+    )
+
+    snapshot = account_usage.fetch_account_usage(
+        "openai-codex",
+        base_url="https://chatgpt.com/backend-api/codex",
+        api_key="live-agent-token",
+    )
+
+    assert snapshot is not None
+    assert [window.label for window in snapshot.windows] == ["Weekly"]
+    assert snapshot.usage_windows_complete is False
+
+    from agent.credential_pool import _select_codex_policy_window
+
+    assert _select_codex_policy_window(snapshot) is None
+
+
+@pytest.mark.parametrize("invalid_window_seconds", [0.5, 1.9])
+def test_codex_usage_rejects_fractional_window_seconds(
+    monkeypatch, codex_usage_payload, invalid_window_seconds
+):
+    calls = []
+    codex_usage_payload["rate_limit"].pop("secondary_window")
+    codex_usage_payload["rate_limit"]["primary_window"]["limit_window_seconds"] = (
+        invalid_window_seconds
+    )
+    monkeypatch.setattr(
+        account_usage.httpx,
+        "Client",
+        lambda timeout: _FakeClient(calls, codex_usage_payload),
+    )
+
+    snapshot = account_usage.fetch_account_usage(
+        "openai-codex",
+        base_url="https://chatgpt.com/backend-api/codex",
+        api_key="live-agent-token",
+    )
+
+    assert snapshot is not None
+    assert snapshot.windows[0].limit_window_seconds is None
+    assert snapshot.usage_windows_complete is False
+
+
+def test_codex_usage_preserves_large_integer_window_seconds(
+    monkeypatch, codex_usage_payload
+):
+    calls = []
+    huge_window_seconds = 10**400
+    codex_usage_payload["rate_limit"]["primary_window"]["limit_window_seconds"] = (
+        huge_window_seconds
+    )
+    monkeypatch.setattr(
+        account_usage.httpx,
+        "Client",
+        lambda timeout: _FakeClient(calls, codex_usage_payload),
+    )
+
+    snapshot = account_usage.fetch_account_usage(
+        "openai-codex",
+        base_url="https://chatgpt.com/backend-api/codex",
+        api_key="live-agent-token",
+    )
+
+    assert snapshot is not None
+    assert snapshot.windows[0].limit_window_seconds == huge_window_seconds
+    assert snapshot.usage_windows_complete is True
+
+
+@pytest.mark.parametrize(
+    "invalid_window_seconds",
+    [True, 0, -1, float("nan"), float("inf"), "604800"],
+)
+def test_codex_usage_marks_invalid_window_seconds_incomplete(
+    monkeypatch, codex_usage_payload, invalid_window_seconds
+):
+    calls = []
+    codex_usage_payload["rate_limit"].pop("secondary_window")
+    codex_usage_payload["rate_limit"]["primary_window"]["limit_window_seconds"] = (
+        invalid_window_seconds
+    )
+    monkeypatch.setattr(
+        account_usage.httpx,
+        "Client",
+        lambda timeout: _FakeClient(calls, codex_usage_payload),
+    )
+
+    snapshot = account_usage.fetch_account_usage(
+        "openai-codex",
+        base_url="https://chatgpt.com/backend-api/codex",
+        api_key="live-agent-token",
+    )
+
+    assert snapshot is not None
+    assert snapshot.windows[0].limit_window_seconds is None
+    assert snapshot.usage_windows_complete is False
+
+
+def test_codex_usage_accepts_integer_valued_float_window_seconds(
+    monkeypatch, codex_usage_payload
+):
+    calls = []
+    codex_usage_payload["rate_limit"]["primary_window"]["limit_window_seconds"] = (
+        604_800.0
+    )
+    monkeypatch.setattr(
+        account_usage.httpx,
+        "Client",
+        lambda timeout: _FakeClient(calls, codex_usage_payload),
+    )
+
+    snapshot = account_usage.fetch_account_usage(
+        "openai-codex",
+        base_url="https://chatgpt.com/backend-api/codex",
+        api_key="live-agent-token",
+    )
+
+    assert snapshot is not None
+    assert snapshot.windows[0].limit_window_seconds == 604_800
+    assert snapshot.usage_windows_complete is True
+
+
+@pytest.mark.parametrize(
+    "invalid_reset_at",
+    [True, "not-a-date", float("inf"), 10**400],
+)
+def test_codex_usage_marks_invalid_reset_metadata_incomplete(
+    monkeypatch, codex_usage_payload, invalid_reset_at
+):
+    calls = []
+    codex_usage_payload["rate_limit"]["primary_window"]["used_percent"] = 90
+    codex_usage_payload["rate_limit"]["primary_window"]["reset_at"] = invalid_reset_at
+    monkeypatch.setattr(
+        account_usage.httpx,
+        "Client",
+        lambda timeout: _FakeClient(calls, codex_usage_payload),
+    )
+
+    snapshot = account_usage.fetch_account_usage(
+        "openai-codex",
+        base_url="https://chatgpt.com/backend-api/codex",
+        api_key="live-agent-token",
+    )
+
+    assert snapshot is not None
+    assert snapshot.usage_windows_complete is False
+
+    from agent.credential_pool import _select_codex_policy_window
+
+    assert _select_codex_policy_window(snapshot) is None
+
+
+def test_window_duration_does_not_change_usage_rendering():
+    fetched_at = account_usage._utc_now()
+    without_duration = account_usage.AccountUsageSnapshot(
+        provider="openai-codex",
+        source="test",
+        fetched_at=fetched_at,
+        windows=(account_usage.AccountUsageWindow(label="Weekly", used_percent=21),),
+    )
+    with_duration = account_usage.AccountUsageSnapshot(
+        provider="openai-codex",
+        source="test",
+        fetched_at=fetched_at,
+        windows=(
+            account_usage.AccountUsageWindow(
+                label="Weekly",
+                used_percent=21,
+                limit_window_seconds=604_800,
+            ),
+        ),
+    )
+
+    assert account_usage.render_account_usage_lines(
+        with_duration
+    ) == account_usage.render_account_usage_lines(without_duration)
+
+
+def test_codex_usage_falls_back_to_native_credential_pool(
+    monkeypatch, codex_usage_payload
+):
     calls = []
     monkeypatch.setattr(
         account_usage.httpx,
@@ -92,7 +366,9 @@ def test_codex_usage_falls_back_to_native_credential_pool(monkeypatch, codex_usa
         account_usage,
         "resolve_codex_runtime_credentials",
         lambda **kwargs: (_ for _ in ()).throw(
-            account_usage.AuthError("no singleton auth", provider="openai-codex", code="codex_auth_missing")
+            account_usage.AuthError(
+                "no singleton auth", provider="openai-codex", code="codex_auth_missing"
+            )
         ),
     )
 
@@ -118,9 +394,9 @@ def test_codex_usage_falls_back_to_native_credential_pool(monkeypatch, codex_usa
     assert "ChatGPT-Account-Id" not in calls[0]["headers"]
 
 
-
-
-def test_codex_usage_account_id_read_failure_keeps_singleton_token(monkeypatch, codex_usage_payload):
+def test_codex_usage_account_id_read_failure_keeps_singleton_token(
+    monkeypatch, codex_usage_payload
+):
     """When the resolver succeeds but the separate account_id read raises, the
     working singleton token must still be used (best-effort account_id), NOT
     abandoned in favor of a header-less pool credential."""
@@ -142,7 +418,11 @@ def test_codex_usage_account_id_read_failure_keeps_singleton_token(monkeypatch, 
         account_usage,
         "_read_codex_tokens",
         lambda *a, **k: (_ for _ in ()).throw(
-            account_usage.AuthError("partial store", provider="openai-codex", code="codex_auth_invalid_shape")
+            account_usage.AuthError(
+                "partial store",
+                provider="openai-codex",
+                code="codex_auth_invalid_shape",
+            )
         ),
     )
 
@@ -151,7 +431,9 @@ def test_codex_usage_account_id_read_failure_keeps_singleton_token(monkeypatch, 
     monkeypatch.setattr(
         credential_pool,
         "load_pool",
-        lambda provider: (_ for _ in ()).throw(AssertionError("pool must not be consulted")),
+        lambda provider: (_ for _ in ()).throw(
+            AssertionError("pool must not be consulted")
+        ),
     )
 
     snapshot = account_usage.fetch_account_usage("openai-codex")
@@ -160,8 +442,6 @@ def test_codex_usage_account_id_read_failure_keeps_singleton_token(monkeypatch, 
     assert calls[0]["headers"]["Authorization"] == "Bearer singleton-token"
     # account_id read failed → header omitted, but the singleton token is kept.
     assert "ChatGPT-Account-Id" not in calls[0]["headers"]
-
-
 
 
 # ── Banked rate-limit reset credits (`/usage reset`) ─────────────────────────
@@ -186,7 +466,12 @@ class _FakeResetClient:
         return _FakeResponse(self.usage_payload)
 
     def post(self, url, headers=None, json=None):
-        self.calls.append({"method": "POST", "url": url, "headers": headers, "json": json})
+        self.calls.append({
+            "method": "POST",
+            "url": url,
+            "headers": headers,
+            "json": json,
+        })
         return _FakeResponse(self.consume_payload)
 
 
@@ -195,25 +480,14 @@ def _usage_payload_with_resets(primary_used, secondary_used, banked):
         "plan_type": "plus",
         "rate_limit": {
             "primary_window": {"used_percent": primary_used, "reset_at": 1779846359},
-            "secondary_window": {"used_percent": secondary_used, "reset_at": 1780230796},
+            "secondary_window": {
+                "used_percent": secondary_used,
+                "reset_at": 1780230796,
+            },
         },
         "rate_limit_reset_credits": {"available_count": banked},
         "credits": {"has_credits": False},
     }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 def test_redeem_missing_credentials_reports_unavailable(monkeypatch):

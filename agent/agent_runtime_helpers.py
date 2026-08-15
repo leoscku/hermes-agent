@@ -1238,7 +1238,15 @@ def recover_with_credential_pool(
         refresh_kwargs = {"api_key_hint": _api_key_hint}
         if _credential_id:
             refresh_kwargs["credential_id"] = _credential_id
-        refreshed = pool.try_refresh_matching(**refresh_kwargs)
+        refresh_with_status = getattr(
+            pool, "try_refresh_matching_with_admission_status", None
+        )
+        if callable(refresh_with_status):
+            refreshed, policy_denied_id = refresh_with_status(**refresh_kwargs)
+        else:
+            # Backward compatibility for third-party/lightweight pool adapters.
+            refreshed = pool.try_refresh_matching(**refresh_kwargs)
+            policy_denied_id = None
         if refreshed is not None:
             # ``try_refresh_matching()`` re-mints a fresh OAuth token and reports
             # success even when the upstream keeps rejecting it — a single-entry
@@ -1267,6 +1275,22 @@ def recover_with_credential_pool(
             _ra().logger.info("Credential auth failure — refreshed pool entry %s", getattr(refreshed, 'id', '?'))
             agent._swap_credential(refreshed)
             return True, has_retried_429
+        if policy_denied_id is not None:
+            # Refresh succeeded, but the same stable entry is at/above its
+            # configured admission ceiling. Do not mark it exhausted for the
+            # original 401: policy exclusion is separate from credential
+            # health. Select an eligible sibling or allow provider fallback.
+            next_entry = pool.select()
+            if next_entry is not None:
+                _ra().logger.info(
+                    "Credential auth refresh produced policy-excluded pool "
+                    "entry %s — selected eligible pool entry %s",
+                    policy_denied_id,
+                    getattr(next_entry, "id", "?"),
+                )
+                agent._swap_credential(next_entry)
+                return True, False
+            return False, has_retried_429
         # Refresh failed — rotate to next credential instead of giving up.
         # The failed entry is already marked exhausted by the refresh attempt.
         rotate_status = status_code if status_code is not None else 401
@@ -1532,15 +1556,22 @@ def restore_primary_runtime(agent) -> bool:
     # pool-rebind block below via ``prefetched_primary_pool`` so the load
     # happens at most once per restore.
     prefetched_primary_pool = None
+    preselected_primary_entry = None
     try:
         primary_provider = str(
             (agent._primary_runtime or {}).get("provider") or ""
         ).strip().lower()
+        primary_pool_entry_id = str(
+            (agent._primary_runtime or {}).get("credential_pool_entry_id") or ""
+        ).strip()
         pool = getattr(agent, "_credential_pool", None)
-        if not credential_pool_matches_provider(
-            pool,
-            primary_provider,
-            base_url=str((agent._primary_runtime or {}).get("base_url") or ""),
+        if (
+            (pool is None and primary_pool_entry_id)
+            or not credential_pool_matches_provider(
+                pool,
+                primary_provider,
+                base_url=str((agent._primary_runtime or {}).get("base_url") or ""),
+            )
         ):
             from agent.credential_pool import load_pool
 
@@ -1561,6 +1592,26 @@ def restore_primary_runtime(agent) -> bool:
                     agent.model,
                 )
             return False
+        if pool is not None:
+            from agent.credential_pool import (
+                get_pool_usage_limits,
+                usage_admission_policy_denied,
+            )
+
+            if get_pool_usage_limits(primary_provider):
+                preselected_primary_entry = pool.select()
+                if (
+                    preselected_primary_entry is None
+                    and usage_admission_policy_denied(primary_provider)
+                ):
+                    logger.info(
+                        "Primary %s is excluded by credential usage policy; "
+                        "staying on fallback %s/%s",
+                        primary_provider or "?",
+                        agent.provider,
+                        agent.model,
+                    )
+                    return False
     except Exception:
         logger.debug(
             "Reset-aware restore gate failed; falling back to per-turn retry",
@@ -1657,7 +1708,10 @@ def restore_primary_runtime(agent) -> bool:
                 pool_matches_primary = bool(primary_key) and primary_key == pool_provider
             except Exception:
                 pool_matches_primary = False
-        if pool is not None and pool_provider and not pool_matches_primary:
+        if not pool_matches_primary and (
+            prefetched_primary_pool is not None
+            or (pool is not None and pool_provider)
+        ):
             agent._credential_pool = None
             agent._credential_pool_entry_id = None
             try:
@@ -1686,8 +1740,10 @@ def restore_primary_runtime(agent) -> bool:
         # keep the snapshot key (the existing behavior).  Fixes #25205.
         agent._credential_pool_entry_id = None
         pool = getattr(agent, "_credential_pool", None)
-        if pool is not None and pool.has_available():
-            entry = pool.select()
+        if pool is not None and (
+            preselected_primary_entry is not None or pool.has_available()
+        ):
+            entry = preselected_primary_entry or pool.select()
             if entry is not None:
                 entry_provider = str(getattr(entry, "provider", "") or "").strip().lower()
                 entry_matches_primary = entry_provider == primary_provider
@@ -2740,6 +2796,7 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
                     "continuing without pool rotation this turn",
                     new_provider, _pool_exc,
                 )
+        sync_credential_pool_entry_id(agent)
         # ── Build new client ──
         if (new_provider or "").strip().lower() == "moa":
             from agent.moa_loop import build_moa_facade
@@ -2966,6 +3023,9 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
         "base_url": agent.base_url,
         "api_mode": agent.api_mode,
         "api_key": getattr(agent, "api_key", ""),
+        "credential_pool_entry_id": getattr(
+            agent, "_credential_pool_entry_id", None
+        ),
         "client_kwargs": dict(agent._client_kwargs),
         "use_prompt_caching": agent._use_prompt_caching,
         "use_native_cache_layout": agent._use_native_cache_layout,

@@ -457,7 +457,10 @@ def auth_list_command(args) -> None:
                 marker = "← "
             status = _format_exhausted_status(entry)
             source = _display_source(entry.source)
-            print(f"  #{idx}  {entry.label:<20} {entry.auth_type:<7} {source}{status} {marker}".rstrip())
+            print(
+                f"  #{idx}  {entry.label:<20} {entry.auth_type:<7} "
+                f"{source}{status} id={entry.id} {marker}".rstrip()
+            )
         print()
 
 

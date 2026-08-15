@@ -91,6 +91,11 @@ class TestCatchAllPatterns:
 class TestConfigYamlRouting:
     """Regular config keys should go to config.yaml, NOT .env."""
 
+    def test_credential_pool_usage_limits_default_is_empty_mapping(self):
+        from hermes_cli.config_defaults import DEFAULT_CONFIG
+
+        assert DEFAULT_CONFIG["credential_pool_usage_limits"] == {}
+
     def test_simple_key(self, _isolated_hermes_home):
         set_config_value("model", "gpt-4o")
         config = _read_config(_isolated_hermes_home)
@@ -496,6 +501,7 @@ class TestValidateConfigKey:
         "telegram.bot_token",
         "mcp_servers.foo.command",
         "providers.openrouter.api_key",
+        "credential_pool_usage_limits.openai-codex.a1b2c3",
         "gateway.strict",
         "platforms.discord.enabled",
         "gateway.platforms.my_platform.extra.token",

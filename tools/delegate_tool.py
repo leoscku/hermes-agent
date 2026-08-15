@@ -1646,6 +1646,15 @@ def _build_child_agent(
     if not override_base_url:
         effective_base_url = _inherit_parent_base_url(parent_agent, effective_base_url)
     effective_api_key = override_api_key or parent_api_key
+    configured_delegation_api_key = str(
+        delegation_cfg.get("api_key") or ""
+    ).strip()
+    explicit_delegation_api_key = (
+        effective_api_key
+        if configured_delegation_api_key
+        and configured_delegation_api_key == override_api_key
+        else None
+    )
     # Bug #20558 / PR #20563: api_mode must NOT be inherited when the child uses a
     # different provider than the parent — each provider has its own API surface
     # (e.g. MiniMax uses anthropic_messages, DeepSeek uses chat_completions).
@@ -1901,7 +1910,10 @@ def _build_child_agent(
     # Share a credential pool with the child when possible so subagents can
     # rotate credentials on rate limits instead of getting pinned to one key.
     child_pool = _resolve_child_credential_pool(
-        effective_provider, parent_agent, effective_base_url
+        effective_provider,
+        parent_agent,
+        effective_base_url,
+        explicit_api_key=explicit_delegation_api_key,
     )
     if child_pool is not None:
         child._credential_pool = child_pool
@@ -2328,15 +2340,95 @@ def _run_single_child(
 
     child_pool = getattr(child, "_credential_pool", None)
     leased_cred_id = None
+    credential_error = None
+
+    def _pool_policy_denied(pool: Any) -> bool:
+        try:
+            from agent.credential_pool import usage_admission_policy_denied
+
+            pool_provider = str(getattr(pool, "provider", "") or "")
+            return bool(
+                pool_provider and usage_admission_policy_denied(pool_provider)
+            )
+        except Exception as exc:
+            logger.debug("Failed to inspect child credential admission: %s", exc)
+            return False
+
+    def _bind_exact_lease(pool: Any, credential_id: str) -> None:
+        entries_method = getattr(pool, "entries", None)
+        swap_credential = getattr(child, "_swap_credential", None)
+        if not callable(entries_method) or not callable(swap_credential):
+            raise RuntimeError("child pool does not support exact lease binding")
+        leased_entry = next(
+            (
+                entry
+                for entry in entries_method()
+                if str(getattr(entry, "id", "") or "") == credential_id
+            ),
+            None,
+        )
+        if leased_entry is None:
+            raise RuntimeError("leased credential no longer exists in child pool")
+        swap_credential(leased_entry)
+        if str(getattr(child, "_credential_pool_entry_id", "") or "") != credential_id:
+            raise RuntimeError("child did not bind the exact leased credential")
+
     if child_pool is not None:
-        leased_cred_id = child_pool.acquire_lease()
+        raw_lease_id = child_pool.acquire_lease()
+        leased_cred_id = (
+            raw_lease_id.strip()
+            if isinstance(raw_lease_id, str) and raw_lease_id.strip()
+            else None
+        )
         if leased_cred_id is not None:
             try:
-                leased_entry = child_pool.current()
-                if leased_entry is not None and hasattr(child, "_swap_credential"):
-                    child._swap_credential(leased_entry)
+                _bind_exact_lease(child_pool, leased_cred_id)
             except Exception as exc:
                 logger.debug("Failed to bind child to leased credential: %s", exc)
+                credential_error = (
+                    "The leased credential could not be bound to the delegated "
+                    "child, so the child was not started."
+                )
+        else:
+            if _pool_policy_denied(child_pool):
+                activated = False
+                activate_fallback = getattr(child, "_try_activate_fallback", None)
+                if callable(activate_fallback):
+                    try:
+                        activated = bool(activate_fallback())
+                    except Exception as exc:
+                        logger.debug(
+                            "Failed to activate child fallback after policy denial: %s",
+                            exc,
+                        )
+                if activated:
+                    child_pool = getattr(child, "_credential_pool", None)
+                    if child_pool is not None:
+                        raw_lease_id = child_pool.acquire_lease()
+                        leased_cred_id = (
+                            raw_lease_id.strip()
+                            if isinstance(raw_lease_id, str) and raw_lease_id.strip()
+                            else None
+                        )
+                        if leased_cred_id is not None:
+                            try:
+                                _bind_exact_lease(child_pool, leased_cred_id)
+                            except Exception as exc:
+                                logger.debug(
+                                    "Failed to bind child to fallback lease: %s", exc
+                                )
+                                credential_error = (
+                                    "The fallback credential could not be bound "
+                                    "to the delegated child, so the child was not "
+                                    "started."
+                                )
+                if not activated or (
+                    leased_cred_id is None and _pool_policy_denied(child_pool)
+                ):
+                    credential_error = (
+                        "No credential is eligible under the configured usage "
+                        "admission policy, and no fallback provider is available."
+                    )
 
     # Heartbeat: periodically propagate child activity to the parent so the
     # gateway inactivity timeout doesn't fire while the subagent is working.
@@ -2499,6 +2591,17 @@ def _run_single_child(
             entry_dict["worktree"] = dict(_worktree_info)
 
     try:
+        if credential_error:
+            return {
+                "task_index": task_index,
+                "status": "error",
+                "summary": None,
+                "error": credential_error,
+                "exit_reason": "credential_unavailable",
+                "api_calls": 0,
+                "duration_seconds": round(time.monotonic() - child_start, 2),
+                "_child_role": getattr(child, "_delegate_role", None),
+            }
         _heartbeat_thread.start()
         if child_progress_cb:
             try:
@@ -4155,6 +4258,8 @@ def _resolve_child_credential_pool(
     effective_provider: Optional[str],
     parent_agent,
     effective_base_url: Optional[str] = None,
+    *,
+    explicit_api_key: Optional[str] = None,
 ):
     """Resolve a credential pool for the child agent.
 
@@ -4174,6 +4279,23 @@ def _resolve_child_credential_pool(
     ``custom:<name>`` pool key derived from the base_url) and only share the
     parent's pool when both resolve to the *same* custom endpoint.
     """
+    if explicit_api_key:
+        # An operator-supplied delegation.api_key is a fixed credential, not
+        # permission to substitute any sibling from that provider's pool.
+        # Matching pooled Codex tokens still honor their stable-ID policy;
+        # unrelated explicit tokens remain usable and never acquire a lease.
+        if str(effective_provider or "").strip().lower() == "openai-codex":
+            from agent.credential_pool import usage_admission_credential_denied
+
+            if usage_admission_credential_denied(
+                "openai-codex", explicit_api_key
+            ):
+                raise ValueError(
+                    "Explicit delegation credential is excluded by the "
+                    "configured usage policy"
+                )
+        return None
+
     if not effective_provider:
         return getattr(parent_agent, "_credential_pool", None)
 

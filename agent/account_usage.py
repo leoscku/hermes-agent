@@ -9,7 +9,12 @@ from typing import TYPE_CHECKING, Any, Optional
 import httpx
 
 from agent.anthropic_adapter import _is_oauth_token, resolve_anthropic_token
-from hermes_cli.auth import AuthError, _read_codex_tokens, resolve_codex_runtime_credentials
+from hermes_cli.auth import (
+    AuthError,
+    _decode_jwt_claims,
+    _read_codex_tokens,
+    resolve_codex_runtime_credentials,
+)
 from hermes_cli.runtime_provider import resolve_runtime_provider
 
 if TYPE_CHECKING:
@@ -28,6 +33,7 @@ class AccountUsageWindow:
     used_percent: Optional[float] = None
     reset_at: Optional[datetime] = None
     detail: Optional[str] = None
+    limit_window_seconds: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -40,6 +46,7 @@ class AccountUsageSnapshot:
     windows: tuple[AccountUsageWindow, ...] = ()
     details: tuple[str, ...] = ()
     unavailable_reason: Optional[str] = None
+    usage_windows_complete: bool = True
 
     @property
     def available(self) -> bool:
@@ -54,10 +61,16 @@ def _title_case_slug(value: Optional[str]) -> Optional[str]:
 
 
 def _parse_dt(value: Any) -> Optional[datetime]:
-    if value in {None, ""}:
+    if value is None or value == "" or isinstance(value, bool):
         return None
     if isinstance(value, (int, float)):
-        return datetime.fromtimestamp(float(value), tz=timezone.utc)
+        try:
+            timestamp = float(value)
+            if not math.isfinite(timestamp):
+                return None
+            return datetime.fromtimestamp(timestamp, tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
     if isinstance(value, str):
         text = value.strip()
         if not text:
@@ -460,9 +473,25 @@ def _resolve_codex_usage_credentials(
     device-code logins in the pool, so quota diagnostics must not depend only
     on the older singleton store.
     """
+    def account_id_from_token(token: str) -> Optional[str]:
+        claims = _decode_jwt_claims(token)
+        auth_claims = claims.get("https://api.openai.com/auth")
+        if not isinstance(auth_claims, dict):
+            return None
+        account_id = auth_claims.get("chatgpt_account_id")
+        return (
+            account_id.strip()
+            if isinstance(account_id, str) and account_id.strip()
+            else None
+        )
+
     explicit_key = str(api_key or "").strip()
     if explicit_key:
-        return explicit_key, str(base_url or "").strip(), None
+        return (
+            explicit_key,
+            str(base_url or "").strip(),
+            account_id_from_token(explicit_key),
+        )
 
     # Tier 2: the native runtime resolver. It ALREADY falls back to the
     # credential pool when the singleton is empty (see
@@ -489,7 +518,12 @@ def _resolve_codex_usage_credentials(
         except AuthError:
             # Pool-only creds carry no singleton account_id; header is optional.
             logger.debug("codex ▸ /usage account_id read failed (best-effort)", exc_info=True)
-        return creds["api_key"], str(creds.get("base_url", "") or "").strip(), account_id
+        runtime_key = creds["api_key"]
+        return (
+            runtime_key,
+            str(creds.get("base_url", "") or "").strip(),
+            account_id or account_id_from_token(runtime_key),
+        )
     except AuthError:
         logger.debug("codex ▸ /usage runtime resolver returned no creds; trying pool", exc_info=True)
 
@@ -504,12 +538,18 @@ def _resolve_codex_usage_credentials(
     entry = pool.select()
     if entry is None:
         raise RuntimeError("No available openai-codex credential in credential pool")
-    return entry.runtime_api_key, str(entry.runtime_base_url or base_url or "").strip(), None
+    runtime_key = entry.runtime_api_key
+    return (
+        runtime_key,
+        str(entry.runtime_base_url or base_url or "").strip(),
+        account_id_from_token(runtime_key),
+    )
 
 
 def _fetch_codex_account_usage(
     base_url: Optional[str] = None,
     api_key: Optional[str] = None,
+    timeout: float = 15.0,
 ) -> Optional[AccountUsageSnapshot]:
     token, resolved_base_url, account_id = _resolve_codex_usage_credentials(base_url, api_key)
     headers = {
@@ -519,22 +559,67 @@ def _fetch_codex_account_usage(
     }
     if account_id:
         headers["ChatGPT-Account-Id"] = account_id
-    with httpx.Client(timeout=15.0) as client:
+    with httpx.Client(timeout=timeout) as client:
         response = client.get(_resolve_codex_usage_url(resolved_base_url), headers=headers)
         response.raise_for_status()
     payload = response.json() or {}
     rate_limit = payload.get("rate_limit") or {}
     windows: list[AccountUsageWindow] = []
+    usage_windows_complete = True
     for key, label in (("primary_window", "Session"), ("secondary_window", "Weekly")):
-        window = rate_limit.get(key) or {}
+        window = rate_limit.get(key)
+        if window is None:
+            usage_windows_complete = False
+            continue
+        if not isinstance(window, dict):
+            usage_windows_complete = False
+            continue
         used = window.get("used_percent")
         if used is None:
+            usage_windows_complete = False
             continue
+        if isinstance(used, bool) or not isinstance(used, (int, float)):
+            usage_windows_complete = False
+            continue
+        try:
+            used_percent = float(used)
+        except (TypeError, ValueError):
+            usage_windows_complete = False
+            continue
+        if not math.isfinite(used_percent) or not 0 <= used_percent <= 100:
+            usage_windows_complete = False
+            continue
+        raw_window_seconds = window.get("limit_window_seconds")
+        window_seconds = None
+        if raw_window_seconds is not None:
+            if isinstance(raw_window_seconds, int) and not isinstance(
+                raw_window_seconds, bool
+            ):
+                if raw_window_seconds > 0:
+                    window_seconds = raw_window_seconds
+                else:
+                    usage_windows_complete = False
+            elif isinstance(raw_window_seconds, float):
+                if (
+                    math.isfinite(raw_window_seconds)
+                    and raw_window_seconds > 0
+                    and raw_window_seconds.is_integer()
+                ):
+                    window_seconds = int(raw_window_seconds)
+                else:
+                    usage_windows_complete = False
+            else:
+                usage_windows_complete = False
+        raw_reset_at = window.get("reset_at")
+        reset_at = _parse_dt(raw_reset_at)
+        if raw_reset_at is not None and reset_at is None:
+            usage_windows_complete = False
         windows.append(
             AccountUsageWindow(
                 label=label,
-                used_percent=float(used),
-                reset_at=_parse_dt(window.get("reset_at")),
+                used_percent=used_percent,
+                reset_at=reset_at,
+                limit_window_seconds=window_seconds,
             )
         )
     details: list[str] = []
@@ -560,6 +645,7 @@ def _fetch_codex_account_usage(
         plan=_title_case_slug(payload.get("plan_type")),
         windows=tuple(windows),
         details=tuple(details),
+        usage_windows_complete=usage_windows_complete,
     )
 
 
@@ -886,13 +972,18 @@ def fetch_account_usage(
     *,
     base_url: Optional[str] = None,
     api_key: Optional[str] = None,
+    timeout: Optional[float] = None,
 ) -> Optional[AccountUsageSnapshot]:
     normalized = str(provider or "").strip().lower()
     if normalized in {"", "auto", "custom"}:
         return None
     try:
         if normalized == "openai-codex":
-            return _fetch_codex_account_usage(base_url=base_url, api_key=api_key)
+            return _fetch_codex_account_usage(
+                base_url=base_url,
+                api_key=api_key,
+                timeout=15.0 if timeout is None else timeout,
+            )
         if normalized == "anthropic":
             return _fetch_anthropic_account_usage()
         if normalized == "openrouter":
