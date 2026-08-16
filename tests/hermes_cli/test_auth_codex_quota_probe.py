@@ -274,6 +274,43 @@ def test_pool_probe_not_fired_for_non_quota_exhaustion(tmp_path, monkeypatch):
     assert probes == []
 
 
+def test_pool_probe_recovery_survives_fresh_pool_load(tmp_path, monkeypatch):
+    """A positive pool probe must durably clear the matching cooldown."""
+    hermes_home = tmp_path / "hermes"
+    store = _pool_only_rate_limited_store()
+    sibling = dict(store["credential_pool"]["openai-codex"][0])
+    sibling.update(
+        id="cred-still-frozen",
+        label="still-frozen",
+        priority=1,
+        access_token="tok-still-frozen",
+    )
+    store["credential_pool"]["openai-codex"].append(sibling)
+    _write_auth_store(hermes_home, store)
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setattr(
+        auth_mod,
+        "_probe_codex_quota_restored",
+        lambda token, **kw: token == "tok-quota",
+    )
+
+    from agent.credential_pool import load_pool
+
+    selected = load_pool("openai-codex").select()
+    assert selected is not None
+    assert selected.id == "cred-quota"
+
+    reloaded = load_pool("openai-codex")
+    persisted = next(entry for entry in reloaded.entries() if entry.id == "cred-quota")
+    still_frozen = next(
+        entry for entry in reloaded.entries() if entry.id == "cred-still-frozen"
+    )
+    assert persisted.last_status == "ok"
+    assert persisted.last_error_reset_at is None
+    assert still_frozen.last_status == "exhausted"
+    assert still_frozen.last_error_reason == "usage_limit_reached"
+
+
 
 
 # ---------------------------------------------------------------------------
