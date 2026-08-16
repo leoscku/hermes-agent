@@ -4144,25 +4144,31 @@ def resolve_codex_runtime_credentials(
             if stale_token and _probe_codex_quota_restored(
                 stale_token,
                 base_url=pool_rate_limit.get("base_url"),
+                newer_than_status_at=pool_rate_limit.get("last_status_at"),
             ):
-                logger.info(
-                    "Codex quota restored upstream — clearing stale pool cooldown(s)."
+                cleared = clear_codex_pool_quota_cooldowns(
+                    access_token=stale_token,
+                    credential_id=pool_rate_limit.get("credential_id"),
+                    expected_last_status_at=pool_rate_limit.get("last_status_at"),
                 )
-                clear_codex_pool_quota_cooldowns()
-                pool_token = _pool_codex_access_token()
-                if pool_token:
-                    base_url = (
-                        os.getenv("HERMES_CODEX_BASE_URL", "").strip().rstrip("/")
-                        or DEFAULT_CODEX_BASE_URL
+                if cleared:
+                    logger.info(
+                        "Codex quota restored upstream — clearing stale pool cooldown."
                     )
-                    return {
-                        "provider": "openai-codex",
-                        "base_url": base_url,
-                        "api_key": pool_token,
-                        "source": "credential_pool",
-                        "last_refresh": None,
-                        "auth_mode": "chatgpt",
-                    }
+                    pool_token = _pool_codex_access_token()
+                    if pool_token:
+                        base_url = (
+                            os.getenv("HERMES_CODEX_BASE_URL", "").strip().rstrip("/")
+                            or DEFAULT_CODEX_BASE_URL
+                        )
+                        return {
+                            "provider": "openai-codex",
+                            "base_url": base_url,
+                            "api_key": pool_token,
+                            "source": "credential_pool",
+                            "last_refresh": None,
+                            "auth_mode": "chatgpt",
+                        }
             reset_at = pool_rate_limit.get("reset_at")
             if isinstance(reset_at, (int, float)) and reset_at > time.time():
                 remaining = int(reset_at - time.time())
@@ -4250,7 +4256,7 @@ def _is_codex_rate_limit_shaped(
 # credential-selection path while the pool is exhausted, so without a floor a
 # busy gateway would hammer the usage endpoint on every model/auxiliary call.
 CODEX_QUOTA_PROBE_MIN_INTERVAL_SECONDS = 300  # 5 minutes
-_codex_quota_probe_cache: Dict[str, Tuple[float, Optional[bool]]] = {}
+_codex_quota_probe_cache: Dict[str, Tuple[float, float, Optional[bool]]] = {}
 _codex_quota_probe_lock = threading.Lock()
 
 
@@ -4280,6 +4286,7 @@ def _probe_codex_quota_restored(
     *,
     base_url: Optional[str] = None,
     min_interval_seconds: float = CODEX_QUOTA_PROBE_MIN_INTERVAL_SECONDS,
+    newer_than_status_at: Any = None,
 ) -> Optional[bool]:
     """Ask the Codex usage endpoint whether this account's quota is usable again.
 
@@ -4300,7 +4307,9 @@ def _probe_codex_quota_restored(
         payload/status); keep the cooldown.
 
     Probes are throttled per access token (module-local cache) so the hot
-    selection path can fire this freely.
+    selection path can fire this freely.  When *newer_than_status_at* is
+    supplied, a cached success that predates that cooldown is ignored and a
+    fresh probe is made.
     """
     token = str(access_token or "").strip()
     if not token:
@@ -4312,13 +4321,22 @@ def _probe_codex_quota_restored(
         return None
     cache_key = hashlib.sha256(token.encode("utf-8")).hexdigest()[:16]
     now = time.monotonic()
+    probe_started_at = time.time()
+    newer_status_at = _coerce_codex_pool_status_at(newer_than_status_at)
     with _codex_quota_probe_lock:
         cached = _codex_quota_probe_cache.get(cache_key)
         if cached is not None and (now - cached[0]) < min_interval_seconds:
-            return cached[1]
+            cached_started_at, cached_result = cached[1], cached[2]
+            cached_success_is_stale = (
+                cached_result is True
+                and newer_status_at is not None
+                and cached_started_at < newer_status_at
+            )
+            if not cached_success_is_stale:
+                return cached_result
         # Reserve the slot immediately so concurrent selectors don't stampede
         # the endpoint while this probe is in flight.
-        _codex_quota_probe_cache[cache_key] = (now, None)
+        _codex_quota_probe_cache[cache_key] = (now, probe_started_at, None)
 
     result: Optional[bool] = None
     try:
@@ -4356,11 +4374,40 @@ def _probe_codex_quota_restored(
         result = None
 
     with _codex_quota_probe_lock:
-        _codex_quota_probe_cache[cache_key] = (now, result)
+        _codex_quota_probe_cache[cache_key] = (now, probe_started_at, result)
     return result
 
 
-def clear_codex_pool_quota_cooldowns(access_token: Optional[str] = None) -> int:
+_CODEX_STATUS_AT_UNSET = object()
+
+
+def _coerce_codex_pool_status_at(value: Any) -> Optional[float]:
+    """Normalize persisted pool status timestamps for compare-and-clear."""
+    if value is None or value == "" or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        numeric = float(value)
+    elif isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return None
+        try:
+            numeric = float(raw)
+        except ValueError:
+            return _parse_iso_timestamp(raw)
+    else:
+        return None
+    if not (-float("inf") < numeric < float("inf")):
+        return None
+    return numeric / 1000.0 if numeric > 1_000_000_000_000 else numeric
+
+
+def clear_codex_pool_quota_cooldowns(
+    access_token: Optional[str] = None,
+    *,
+    credential_id: Optional[str] = None,
+    expected_last_status_at: Any = _CODEX_STATUS_AT_UNSET,
+) -> int:
     """Clear rate-limit cooldowns on persisted openai-codex pool entries.
 
     Called after the upstream quota is KNOWN to be restored (a successful
@@ -4369,8 +4416,13 @@ def clear_codex_pool_quota_cooldowns(access_token: Optional[str] = None) -> int:
     ``exhausted`` entries whose error metadata is 429/quota-shaped — DEAD
     (terminal auth) entries and non-rate-limit failures are untouched.
 
-    When *access_token* is given, only the matching entry is cleared;
-    otherwise every rate-limited entry clears (a redeemed banked reset
+    When *access_token* or *credential_id* is given, only matching entries are
+    cleared.  When *expected_last_status_at* is supplied, an entry is cleared
+    only if its persisted cooldown is no newer than that observed timestamp.
+    This compare-and-clear prevents a successful probe from erasing a 429
+    written concurrently after the probe began.
+
+    With no filters every rate-limited entry clears (a redeemed banked reset
     restores the whole account, and any entry that is genuinely still
     exhausted just re-freezes with fresh metadata on its next 429).
 
@@ -4389,8 +4441,24 @@ def clear_codex_pool_quota_cooldowns(access_token: Optional[str] = None) -> int:
                     continue
                 if entry.get("last_status") != "exhausted":
                     continue
+                if credential_id and str(entry.get("id") or "") != credential_id:
+                    continue
                 if access_token and str(entry.get("access_token") or "") != access_token:
                     continue
+                if expected_last_status_at is not _CODEX_STATUS_AT_UNSET:
+                    expected_status_at = _coerce_codex_pool_status_at(
+                        expected_last_status_at
+                    )
+                    persisted_raw = entry.get("last_status_at")
+                    persisted_status_at = _coerce_codex_pool_status_at(persisted_raw)
+                    if expected_status_at is None:
+                        if persisted_raw not in (None, ""):
+                            continue
+                    elif (
+                        persisted_status_at is None
+                        or persisted_status_at > expected_status_at
+                    ):
+                        continue
                 if not _is_codex_rate_limit_shaped(
                     entry.get("last_error_code"),
                     entry.get("last_error_reason"),
@@ -4473,8 +4541,10 @@ def _codex_pool_rate_limit_status() -> Optional[Dict[str, Any]]:
             if reset_at is not None and reset_at <= now:
                 continue
             return {
+                "credential_id": entry.get("id"),
                 "label": entry.get("label"),
                 "last_refresh": entry.get("last_refresh"),
+                "last_status_at": entry.get("last_status_at"),
                 "reset_at": reset_at,
                 "reason": entry.get("last_error_reason"),
                 "message": entry.get("last_error_message"),

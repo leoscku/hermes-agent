@@ -123,6 +123,34 @@ def test_probe_sends_chatgpt_account_id_from_jwt(monkeypatch):
     assert calls[0]["headers"].get("ChatGPT-Account-Id") == "acct-123"
 
 
+def test_probe_ignores_cached_success_older_than_new_cooldown(monkeypatch):
+    calls = []
+    responses = iter(
+        [
+            _StubResponse(200, _usage_payload(0.0, 0.0)),
+            _StubResponse(429, {}),
+        ]
+    )
+    monkeypatch.setattr(
+        auth_mod.httpx,
+        "Client",
+        lambda **kwargs: _StubClient(calls, next(responses)),
+    )
+    token = _jwt({"exp": time.time() + 3600})
+
+    assert _probe_codex_quota_restored(token) is True
+    cooldown_written_at = time.time()
+
+    assert (
+        _probe_codex_quota_restored(
+            token,
+            newer_than_status_at=cooldown_written_at,
+        )
+        is False
+    )
+    assert len(calls) == 2
+
+
 # ---------------------------------------------------------------------------
 # clear_codex_pool_quota_cooldowns
 # ---------------------------------------------------------------------------
@@ -240,6 +268,37 @@ def test_resolver_recovers_when_probe_confirms_reset(tmp_path, monkeypatch):
     assert entry["last_error_reset_at"] is None
 
 
+def test_resolver_does_not_clear_newer_concurrent_429(tmp_path, monkeypatch):
+    hermes_home = tmp_path / "hermes"
+    observed_at = time.time()
+    _write_auth_store(hermes_home, _pool_only_rate_limited_store(observed_at))
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    newer_status_at = observed_at + 1.0
+
+    def _probe_then_concurrent_429(token, **kwargs):
+        assert token == "tok-quota"
+        store = json.loads((hermes_home / "auth.json").read_text())
+        entry = store["credential_pool"]["openai-codex"][0]
+        entry["last_status_at"] = newer_status_at
+        entry["last_error_message"] = "newer concurrent resolver 429"
+        _write_auth_store(hermes_home, store)
+        return True
+
+    monkeypatch.setattr(
+        auth_mod,
+        "_probe_codex_quota_restored",
+        _probe_then_concurrent_429,
+    )
+
+    with pytest.raises(AuthError) as exc_info:
+        resolve_codex_runtime_credentials()
+
+    assert exc_info.value.code == auth_mod.CODEX_RATE_LIMITED_CODE
+    persisted = json.loads((hermes_home / "auth.json").read_text())
+    entry = persisted["credential_pool"]["openai-codex"][0]
+    assert entry["last_status"] == "exhausted"
+    assert entry["last_status_at"] == newer_status_at
+    assert entry["last_error_message"] == "newer concurrent resolver 429"
 
 
 # ---------------------------------------------------------------------------
@@ -311,6 +370,40 @@ def test_pool_probe_recovery_survives_fresh_pool_load(tmp_path, monkeypatch):
     assert still_frozen.last_error_reason == "usage_limit_reached"
 
 
+def test_pool_probe_does_not_clear_newer_concurrent_429(tmp_path, monkeypatch):
+    """A positive probe must not erase a newer cooldown written concurrently."""
+    hermes_home = tmp_path / "hermes"
+    observed_at = time.time()
+    _write_auth_store(hermes_home, _pool_only_rate_limited_store(observed_at))
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("openai-codex")
+    newer_status_at = observed_at + 1.0
+
+    def _probe_then_concurrent_429(token, **kwargs):
+        assert token == "tok-quota"
+        store = json.loads((hermes_home / "auth.json").read_text())
+        entry = store["credential_pool"]["openai-codex"][0]
+        entry["last_status_at"] = newer_status_at
+        entry["last_error_message"] = "newer concurrent 429"
+        _write_auth_store(hermes_home, store)
+        return True
+
+    monkeypatch.setattr(
+        auth_mod,
+        "_probe_codex_quota_restored",
+        _probe_then_concurrent_429,
+    )
+
+    assert pool.select() is None
+
+    persisted = json.loads((hermes_home / "auth.json").read_text())
+    entry = persisted["credential_pool"]["openai-codex"][0]
+    assert entry["last_status"] == "exhausted"
+    assert entry["last_status_at"] == newer_status_at
+    assert entry["last_error_message"] == "newer concurrent 429"
 
 
 # ---------------------------------------------------------------------------

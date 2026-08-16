@@ -2201,6 +2201,7 @@ class CredentialPool:
                 auth_mod._probe_codex_quota_restored(
                     token,
                     base_url=entry.base_url,
+                    newer_than_status_at=entry.last_status_at,
                 )
             )
         except Exception:
@@ -2397,10 +2398,19 @@ class CredentialPool:
                     # store before the normal pool persist. Otherwise the
                     # stale-snapshot merge sees the old disk timestamp as newer
                     # than the cleared in-memory status and resurrects the 429.
-                    # Token scoping keeps unrelated exhausted accounts frozen.
-                    auth_mod.clear_codex_pool_quota_cooldowns(
+                    # Stable-ID and token scoping keep unrelated exhausted
+                    # accounts frozen.
+                    cleared_on_disk = auth_mod.clear_codex_pool_quota_cooldowns(
                         access_token=entry.access_token,
+                        credential_id=entry.id,
+                        expected_last_status_at=entry.last_status_at,
                     )
+                    if not cleared_on_disk:
+                        # The persisted entry was removed, already changed, or
+                        # received a newer cooldown while the probe was in
+                        # flight.  Keep the local entry frozen rather than
+                        # selecting a credential whose latest evidence is 429.
+                        continue
                 if clear_expired:
                     cleared = replace(
                         entry,
