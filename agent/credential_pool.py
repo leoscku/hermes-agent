@@ -2387,11 +2387,20 @@ class CredentialPool:
                     # while the account is already usable again — a throttled
                     # live probe of the Codex usage endpoint detects that and
                     # lifts the stale cooldown (issue #43747).
-                    if not (
+                    restored_upstream = (
                         clear_expired
                         and self._codex_quota_restored_upstream(entry)
-                    ):
+                    )
+                    if not restored_upstream:
                         continue
+                    # Clear the same credential directly in the locked disk
+                    # store before the normal pool persist. Otherwise the
+                    # stale-snapshot merge sees the old disk timestamp as newer
+                    # than the cleared in-memory status and resurrects the 429.
+                    # Token scoping keeps unrelated exhausted accounts frozen.
+                    auth_mod.clear_codex_pool_quota_cooldowns(
+                        access_token=entry.access_token,
+                    )
                 if clear_expired:
                     cleared = replace(
                         entry,
