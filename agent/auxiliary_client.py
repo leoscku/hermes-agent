@@ -4460,8 +4460,14 @@ def _is_invalid_aux_response_error(exc: Exception) -> bool:
     )
 
 
-def _evict_cached_clients(provider: str) -> None:
-    """Drop cached auxiliary clients for a provider so fresh creds are used."""
+def _evict_cached_clients(provider: str, *, close: bool = True) -> None:
+    """Drop cached provider clients, optionally leaving shared clients open.
+
+    Refresh and transport-recovery paths close stale clients by default.  An
+    admission denial passes ``close=False`` because an older, already-admitted
+    request may still be using the object.  Removing only the cache reference
+    blocks new reuse while allowing that request to finish.
+    """
     normalized = _normalize_aux_provider(provider)
     with _client_cache_lock:
         stale_keys = []
@@ -4487,7 +4493,7 @@ def _evict_cached_clients(provider: str) -> None:
                 stale_keys.append(key)
         for key in stale_keys:
             client = _client_cache.get(key, (None, None, None))[0]
-            if client is not None:
+            if close and client is not None:
                 _close_cached_client(client)
             _client_cache.pop(key, None)
 
@@ -7872,7 +7878,7 @@ def _get_cached_client(
                 and admission_entry is None
                 and usage_admission_policy_denied("openai-codex")
             ):
-                _evict_cached_clients("openai-codex")
+                _evict_cached_clients("openai-codex", close=False)
                 # An explicit Codex auxiliary route must stop here, but an
                 # ``auto`` route still owns a fallback ladder.  Continue into
                 # resolve_provider_client("auto") so the next eligible provider
@@ -7934,9 +7940,7 @@ def _get_cached_client(
     )
     if explicit_credential_denied:
         with _client_cache_lock:
-            denied_entry = _client_cache.pop(cache_key, None)
-        if denied_entry is not None:
-            _close_cached_client(denied_entry[0])
+            _client_cache.pop(cache_key, None)
         return None, None
     with _client_cache_lock:
         if cache_key in _client_cache:

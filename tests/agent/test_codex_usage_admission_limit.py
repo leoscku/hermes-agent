@@ -1260,7 +1260,8 @@ def test_cached_auxiliary_codex_client_is_rechecked_after_policy_denial(monkeypa
     import agent.auxiliary_client as auxiliary_client
 
     cache_key = ("openai-codex", "codex-policy-test")
-    cached_client = SimpleNamespace(close=lambda: None)
+    closed = []
+    cached_client = SimpleNamespace(close=lambda: closed.append(True))
     monkeypatch.setattr(
         auxiliary_client,
         "_client_cache_key",
@@ -1297,6 +1298,7 @@ def test_cached_auxiliary_codex_client_is_rechecked_after_policy_denial(monkeypa
         assert client is None
         assert model is None
         assert cache_key not in auxiliary_client._client_cache
+        assert closed == []
     finally:
         with auxiliary_client._client_cache_lock:
             auxiliary_client._client_cache.clear()
@@ -1306,7 +1308,8 @@ def test_cached_auxiliary_explicit_codex_client_rejects_denied_token(monkeypatch
     import agent.auxiliary_client as auxiliary_client
 
     cache_key = ("openai-codex", "explicit-policy-test")
-    cached_client = SimpleNamespace(close=lambda: None)
+    closed = []
+    cached_client = SimpleNamespace(close=lambda: closed.append(True))
     monkeypatch.setattr(
         auxiliary_client,
         "_client_cache_key",
@@ -1338,6 +1341,7 @@ def test_cached_auxiliary_explicit_codex_client_rejects_denied_token(monkeypatch
         assert client is None
         assert model is None
         assert cache_key not in auxiliary_client._client_cache
+        assert closed == []
     finally:
         with auxiliary_client._client_cache_lock:
             auxiliary_client._client_cache.clear()
@@ -1569,9 +1573,10 @@ def test_policy_denial_evicts_auto_clients_tagged_as_codex():
     import agent.auxiliary_client as auxiliary_client
 
     auto_key = ("auto", "cached-codex")
+    closed = []
     cached_client = SimpleNamespace(
         _hermes_aux_effective_provider="openai-codex",
-        close=lambda: None,
+        close=lambda: closed.append(True),
     )
     with auxiliary_client._client_cache_lock:
         auxiliary_client._client_cache.clear()
@@ -1581,8 +1586,9 @@ def test_policy_denial_evicts_auto_clients_tagged_as_codex():
             None,
         )
     try:
-        auxiliary_client._evict_cached_clients("openai-codex")
+        auxiliary_client._evict_cached_clients("openai-codex", close=False)
         assert auto_key not in auxiliary_client._client_cache
+        assert closed == []
     finally:
         with auxiliary_client._client_cache_lock:
             auxiliary_client._client_cache.clear()
@@ -1614,7 +1620,9 @@ def test_auto_auxiliary_continues_to_fallback_after_codex_policy_denial(
         lambda provider: True,
     )
     monkeypatch.setattr(
-        auxiliary_client, "_evict_cached_clients", lambda provider: None
+        auxiliary_client,
+        "_evict_cached_clients",
+        lambda provider, **kwargs: None,
     )
 
     def resolve(provider, model, async_mode=False, **kwargs):
